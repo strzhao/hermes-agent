@@ -1901,6 +1901,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 f"{', '.join(unknown)}. Use one of the documented fields, "
                 "or store extension data under ``metadata`` (dict)."
             )
+        # ``metadata`` is the sanctioned extension slot but must be a dict —
+        # a scalar/list would still merge through and pollute jobs.json (#67625).
+        if "metadata" in updates and not isinstance(updates["metadata"], dict):
+            raise ValueError(
+                "Cron job 'metadata' must be a dict (extension storage), "
+                f"got {type(updates['metadata']).__name__}."
+            )
 
     with _jobs_lock():
         jobs = load_jobs()

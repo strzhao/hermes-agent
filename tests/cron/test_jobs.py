@@ -385,6 +385,18 @@ class TestUpdateJob:
         refreshed = get_job(job["id"])
         assert refreshed["metadata"] == {"ticket": "ABC-123", "team": "ops"}
 
+    def test_update_job_rejects_non_dict_metadata(self, tmp_cron_dir):
+        """``metadata`` must be a dict — a scalar/list would still merge
+        through {**job, **updates} and pollute jobs.json (#67625)."""
+        job = create_job(prompt="x", schedule="every 1h")
+        with pytest.raises(ValueError, match="metadata.*dict"):
+            update_job(job["id"], {"metadata": "not-a-dict"})
+        with pytest.raises(ValueError, match="metadata.*dict"):
+            update_job(job["id"], {"metadata": ["a", "b"]})
+        # Nothing persisted — the real schema stays clean.
+        refreshed = get_job(job["id"])
+        assert refreshed.get("metadata") is None
+
 
 class TestPauseResumeJob:
     def test_pause_sets_state(self, tmp_cron_dir):

@@ -5677,8 +5677,22 @@ class APIServerAdapter(BasePlatformAdapter):
             return id_err
         try:
             body = await request.json()
-            # Whitelist allowed fields to prevent arbitrary key injection
-            sanitized = {k: v for k, v in body.items() if k in self._UPDATE_ALLOWED_FIELDS}
+            # Reject unknown fields (#67625): the gateway previously *silently
+            # dropped* them and returned 200, so a typo'd key took no effect
+            # while the caller believed the update succeeded. Surface as 422.
+            unknown = sorted(set(body) - self._UPDATE_ALLOWED_FIELDS)
+            if unknown:
+                return web.json_response(
+                    {
+                        "error": (
+                            f"Unknown cron job field(s): {', '.join(unknown)}. "
+                            "Use one of the documented fields, or store extension "
+                            "data under 'metadata' (dict)."
+                        )
+                    },
+                    status=422,
+                )
+            sanitized = body
             if not sanitized:
                 return web.json_response({"error": "No valid fields to update"}, status=400)
             # Validate lengths if present

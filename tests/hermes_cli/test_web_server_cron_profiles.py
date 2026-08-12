@@ -515,3 +515,14 @@ async def test_cron_profile_validation_errors(isolated_profiles):
     with pytest.raises(HTTPException) as missing:
         await web_server.list_cron_jobs(profile="missing_profile")
     assert missing.value.status_code == 404
+
+
+def test_dashboard_update_fields_are_subset_of_core():
+    """The dashboard allow-list must stay a subset of the core one (#67625):
+    divergence silently re-introduces the typo-acceptance gap. ``id`` is a
+    dashboard-only payload key (rejected by core as immutable), hence the
+    exclusion."""
+    from cron.jobs import _VALID_JOB_FIELDS
+    from hermes_cli.web_server import _DASHBOARD_ALLOWED_UPDATE_FIELDS
+
+    assert (_DASHBOARD_ALLOWED_UPDATE_FIELDS - {"id"}) <= _VALID_JOB_FIELDS

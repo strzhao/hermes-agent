@@ -11769,13 +11769,17 @@ def _validate_dashboard_cron_effective_job(job: Dict[str, Any]) -> None:
 
 
 _DASHBOARD_ALLOWED_UPDATE_FIELDS = frozenset({
-    # Mirrors cron.jobs._VALID_JOB_FIELDS so rejection here catches
-    # unknown keys before the IPC round-trip (#67625).
+    # Deliberate subset of cron.jobs._VALID_JOB_FIELDS (#67625): the
+    # user-facing dashboard form only edits these fields. Internal state
+    # the form doesn't expose (next_run_at / last_* / created_at /
+    # *_snapshot) is accepted by core but not by the dashboard.
+    # Keep this a subset of cron.jobs._VALID_JOB_FIELDS — guarded by
+    # test_dashboard_update_fields_are_subset_of_core.
     "name", "prompt", "skill", "skills", "model", "provider",
     "base_url", "script", "context_from", "enabled_toolsets",
     "workdir", "no_agent", "schedule", "schedule_display",
     "repeat", "enabled", "state", "paused_at", "paused_reason",
-    "description", "deliver", "origin", "metadata",
+    "description", "deliver", "origin", "attach_to_session", "metadata",
     # ``id`` is allowed as a payload key but rejected by
     # cron.jobs.update_job as immutable — the immutable guard's HTTP
     # 400 error is more idiomatic than a 422 validation error.

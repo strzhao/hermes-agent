@@ -216,7 +216,11 @@ class TestUpdateJob:
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
-        """PATCH /api/jobs/{id} — only allowed fields pass through."""
+        """PATCH /api/jobs/{id} — unknown fields are rejected with 422 (#67625).
+
+        The gateway previously silently dropped unknown keys and returned 200,
+        leaving the caller to believe a typo'd update took effect.
+        """
         app = _create_app(adapter)
         updated_job = {**SAMPLE_JOB, "name": "new-name"}
         mock_update = MagicMock(return_value=updated_job)
@@ -234,12 +238,33 @@ class TestUpdateJob:
                         "__proto__": "hack",
                     },
                 )
+                assert resp.status == 422
+                payload = await resp.json()
+                assert "evil_field" in payload["error"]
+                assert "__proto__" in payload["error"]
+                # Rejected before reaching cron — no partial update persisted.
+                mock_update.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_job_accepts_only_known_fields(self, adapter):
+        """PATCH /api/jobs/{id} — a payload of only known fields updates and returns 200."""
+        app = _create_app(adapter)
+        updated_job = {**SAMPLE_JOB, "name": "new-name"}
+        mock_update = MagicMock(return_value=updated_job)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"name": "new-name", "prompt": "hi"},
+                )
                 assert resp.status == 200
-                call_args = mock_update.call_args
-                sanitized = call_args[0][1]
-                assert "name" in sanitized
-                assert "evil_field" not in sanitized
-                assert "__proto__" not in sanitized
+                sanitized = mock_update.call_args[0][1]
+                assert sanitized["name"] == "new-name"
+                assert sanitized["prompt"] == "hi"
 
 
 # ---------------------------------------------------------------------------
