@@ -360,7 +360,14 @@ class SessionSchemaMixin:
         'rebuild' source, so we DELETE + reinsert the concatenated content
         the legacy triggers produced. Never touches the v23 shape.
         """
-        cursor.execute("DELETE FROM messages_fts")
+        try:
+            cursor.execute("DELETE FROM messages_fts")
+        except sqlite3.DatabaseError:
+            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_insert")
+            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_delete")
+            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_update")
+            cursor.execute("DROP TABLE IF EXISTS messages_fts")
+            cursor.executescript(LEGACY_FTS_SQL)
         cursor.execute(
             "INSERT INTO messages_fts(rowid, content) "
             "SELECT id, "
@@ -371,7 +378,14 @@ class SessionSchemaMixin:
         )
         if not include_trigram:
             return
-        cursor.execute("DELETE FROM messages_fts_trigram")
+        try:
+            cursor.execute("DELETE FROM messages_fts_trigram")
+        except sqlite3.DatabaseError:
+            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_trigram_insert")
+            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_trigram_delete")
+            cursor.execute("DROP TRIGGER IF EXISTS messages_fts_trigram_update")
+            cursor.execute("DROP TABLE IF EXISTS messages_fts_trigram")
+            cursor.executescript(LEGACY_FTS_TRIGRAM_SQL)
         cursor.execute(
             "INSERT INTO messages_fts_trigram(rowid, content) "
             "SELECT id, "
@@ -522,7 +536,6 @@ class SessionSchemaMixin:
             """
             if include_trigram:
                 rebuild_sql += """
-                    DELETE FROM messages_fts_trigram;
                     INSERT INTO messages_fts_trigram(rowid, content)
                     SELECT id,
                            COALESCE(content, '') || ' ' ||
