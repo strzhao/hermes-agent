@@ -351,27 +351,52 @@ class SessionSchemaMixin:
     def _is_malformed_fts_index_error(exc: BaseException) -> bool:
         """True when *exc* is the corrupt-inline-index class that justifies a
         drop-and-recreate rebuild, rather than a transient lock/busy/IO error.
+
+        Class-based split (replaces the earlier message-string classifier,
+        adopted from #86183's review round): corruption — ``SQLITE_CORRUPT``
+        and the FTS5 corrupt-structure class — surfaces as plain
+        ``sqlite3.DatabaseError``, never ``OperationalError``, while
+        ``database is locked`` / ``database is busy`` / disk-IO / readonly
+        surface as ``sqlite3.OperationalError`` (a subclass). An isinstance
+        check therefore classifies both directions with no dependence on
+        SQLite's error wording; verified against a really-corrupt index,
+        which also produced a ``fts5: corrupt structure record`` DELETE
+        failure that the previous string list missed, and a real
+        ``database is locked``.
         """
-        if not isinstance(exc, sqlite3.DatabaseError):
-            return False
-        message = str(exc).lower()
-        return any(
-            marker in message
-            for marker in (
-                "malformed inverted index",
-                "database disk image is malformed",
-                "malformed database schema",
-            )
+        return isinstance(exc, sqlite3.DatabaseError) and not isinstance(
+            exc, sqlite3.OperationalError
         )
 
     _FTS_INTEGRITY_ENGINE_KEY = "fts_integrity_engine"
 
     def _fts_integrity_engine_id(self, cursor: sqlite3.Cursor) -> str:
+        """Engine id plus a capability signature (adopted from #86183).
+
+        A bare version string mis-judges hosts that share a SQLite version
+        but differ in tokenizer availability (e.g. one built without the
+        trigram/cjk tokenizer extension): the incapable host sweeps once and
+        stamps the version, then the capable host reads a matching stamp and
+        skips its own sweep of indexes the incapable host never checked.
+        Appending ``|missing=<tables>`` when a probe returns None makes the
+        stamp an engine+capability pair: an incapable host still sweeps at
+        most once per pair, while a capable host reading its stamp sees the
+        signature mismatch and re-verifies — an incapable host never vouches,
+        on behalf of a capable one, for indexes it could not check.
+        """
         try:
             row = cursor.execute("SELECT sqlite_version()").fetchone()
         except sqlite3.DatabaseError:
             return "fts5:unknown"
-        return f"fts5:{row[0] if row else 'unknown'}"
+        stamp = f"fts5:{row[0] if row else 'unknown'}"
+        missing = sorted(
+            table
+            for table in ("messages_fts_trigram", "messages_fts_cjk")
+            if self._fts_table_probe(cursor, table) is None
+        )
+        if missing:
+            stamp = f"{stamp}|missing={','.join(missing)}"
+        return stamp
 
     def _legacy_fts_integrity_probe_needed(self, cursor: sqlite3.Cursor) -> bool:
         """True until a clean integrity-check has run on this SQLite engine."""
@@ -405,6 +430,10 @@ class SessionSchemaMixin:
         tables = ["messages_fts"]
         if include_trigram:
             tables.append("messages_fts_trigram")
+        # The optional CJK inline index participates in the same engine-mismatch
+        # failure class (#86183); probe first so absent installs stay untouched.
+        if self._fts_table_probe(cursor, "messages_fts_cjk"):
+            tables.append("messages_fts_cjk")
         for table in tables:
             try:
                 cursor.execute(
@@ -413,10 +442,12 @@ class SessionSchemaMixin:
             except sqlite3.DatabaseError as exc:
                 if self._is_malformed_fts_index_error(exc):
                     return True
-                raise
-            except sqlite3.OperationalError as exc:
-                # Missing table or tokenizer — not the corruption class.
-                if "no such table" in str(exc).lower() or "no such module" in str(exc).lower():
+                # Missing table or tokenizer — not the corruption class. The
+                # previous separate `except sqlite3.OperationalError` arm was
+                # unreachable: the subclass is caught by the DatabaseError arm
+                # above, so its conditions belong here.
+                message = str(exc).lower()
+                if "no such table" in message or "no such module" in message:
                     continue
                 raise
         return False
@@ -494,12 +525,37 @@ class SessionSchemaMixin:
         recovery_sql = "BEGIN IMMEDIATE;" + drop_sql + rebuild_sql + "COMMIT;"
         try:
             cursor.executescript(recovery_sql)
-        except sqlite3.DatabaseError:
+        except sqlite3.DatabaseError as fallback_exc:
             try:
                 self._conn.rollback()
             except sqlite3.Error:
                 pass
-            raise
+            # A rolled-back recovery leaves the original malformed table
+            # intact, but a script that died after CREATE can leave the table
+            # empty-but-valid: a later integrity-check would pass it and stamp
+            # the engine marker, freezing a silently-dead index (adopted from
+            # #86183). Persist the ``fts_stale`` breadcrumb and detach FTS
+            # instead — same ordering contract as the deferred branch of
+            # ``_run_admitted_startup_rebuild``: triggers must never be live
+            # over an index with an unrebuilt gap, and the next open routes
+            # through ``_recover_stale_fts`` (full drop/recreate/backfill). FTS
+            # degrades visibly rather than staying silently empty forever.
+            cursor.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (FTS_STALE_KEY,),
+            )
+            self._drop_all_fts_triggers(cursor)
+            self._fts_stale = True
+            self._fts_enabled = False
+            self._trigram_available = False
+            self._fts_cjk_available = False
+            logger.error(
+                "Could not recreate legacy FTS index (%s); marked FTS stale "
+                "for full recovery on next open — run `hermes sessions "
+                "repair` to rebuild it now",
+                fallback_exc,
+            )
 
     def _fts_table_probe(self, cursor: sqlite3.Cursor, table_name: str) -> Optional[bool]:
         try:
