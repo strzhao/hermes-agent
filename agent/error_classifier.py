@@ -143,11 +143,17 @@ _RATE_LIMIT_PATTERNS = (
 # Server busy, credential fine: back off on the same key, never rotate. Z.AI/
 # Zhipu reuse HTTP 429 for this, so the 429 path checks these first. Kept narrow
 # so a plain "you have been rate-limited" doesn't land here. (#14038, #15297)
+# "temporarily unavailable" joins for gateways (CommandCode, #117111) that
+# answer with a 429 about their *upstream* being down — a quota wall never
+# reads that way, so this stays narrow; before it, the "try again in" tail
+# (or the bare-form catch-all) claimed the message as rate_limit and rotated
+# a healthy key.
 _OVERLOADED_PATTERNS = (
     "overloaded", "temporarily overloaded", "service is temporarily overloaded",
     "service may be temporarily overloaded", "server is overloaded", "server overloaded",
     "server overload", "server_overload",
     "service overloaded", "service is overloaded", "upstream overloaded", "currently overloaded",
+    "temporarily unavailable",
     "at capacity", "over capacity",
 )
 

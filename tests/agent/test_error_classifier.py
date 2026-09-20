@@ -569,6 +569,49 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.rate_limit
         assert result.should_rotate_credential is True
 
+    def test_429_upstream_temporarily_unavailable_is_overloaded_not_rate_limit(self):
+        """CommandCode-style gateways answer a healthy key's request with a 429
+        reading 'Upstream model provider is temporarily unavailable' when the
+        *upstream* is down. The credential is fine: the "try again in" tail
+        matched the broad rate-limit vocabulary and the bare form fell through
+        to the catch-all, so the key was benched and the pool rotated for what
+        is a plain upstream outage (#117111 — same defect class as the Z.AI
+        429-overload reuse, #14038). The overloaded-family vocabulary must
+        claim any "temporarily unavailable" shape before the rate-limit rules.
+        """
+        e = MockAPIError(
+            "Upstream model provider is temporarily unavailable. "
+            "Please try again in a moment.",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="commandcode")
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+
+    def test_429_bare_upstream_unavailable_is_overloaded_not_rate_limit(self):
+        """The bare form (no retry tail) must land the same way: without the
+        overload vocabulary it fell through the 429 catch-all into rate_limit
+        and rotated a healthy key (#117111)."""
+        e = MockAPIError(
+            "Upstream model provider is temporarily unavailable.",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="commandcode")
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_rotate_credential is False
+
+    def test_429_message_only_upstream_unavailable_is_overloaded(self):
+        """No status code at all: the message rules see the same sentence and
+        must likewise read it as a busy upstream, not a throttled key."""
+        e = MockAPIError(
+            "Upstream model provider is temporarily unavailable. "
+            "Please try again in a moment.",
+        )
+        result = classify_api_error(e, provider="commandcode")
+        assert result.reason == FailoverReason.overloaded
+        assert result.should_rotate_credential is False
+
     def test_429_with_structured_terminal_quota_code_is_billing(self):
         """LiteLLM stamps ``terminal_quota_exhausted`` on a hard-cap 429. The
         429 handler always returns a verdict, so the structured billing code
