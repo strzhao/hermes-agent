@@ -585,6 +585,36 @@ class TestFalsePositiveReductions:
                 fi.pattern_id == "py_read_secrets_file" for fi in scan_file(f, name)
             ), name
 
+    def test_python_expanduser_wrapped_and_read_variants_are_critical(self, tmp_path):
+        # #116950 follow-up: the path may be os.path.expanduser(...)-wrapped (the natural
+        # form for ~/.env-style stores), and Path() offers more readers than read_text.
+        reads = {
+            "open_exp_env.py": 'import os\ndef f():\n    return open(os.path.expanduser("~/.hermes/.env")).read()\n',
+            "open_exp_ssh.py": 'import os\ndef f():\n    return open(os.path.expanduser("~/.ssh/id_rsa")).read()\n',
+            "path_exp_env.py": "import os\nfrom pathlib import Path\ndef f():\n    return Path(os.path.expanduser('~/.hermes/.env')).read_text()\n",
+            "path_read_bytes.py": "from pathlib import Path\ndef f():\n    return Path('~/.hermes/.env').read_bytes()\n",
+            "path_read_lines.py": "from pathlib import Path\ndef f():\n    return Path('~/.ssh/id_rsa').readlines()\n",
+        }
+        for name, content in reads.items():
+            f = tmp_path / name
+            f.write_text(content, encoding="utf-8")
+            assert any(
+                fi.pattern_id == "py_read_secrets_file" and fi.severity == "critical"
+                for fi in scan_file(f, name)
+            ), name
+
+        benign = tmp_path / "benign.py"
+        benign.write_text(
+            "import os\nfrom pathlib import Path\n"
+            "def setup():\n"
+            "    open(os.path.expanduser('~/.hermes/.env'), 'w').write('KEY=1')\n"
+            "    return Path('config.yaml').read_text()\n",
+            encoding="utf-8",
+        )
+        assert not any(
+            fi.pattern_id == "py_read_secrets_file" for fi in scan_file(benign, "benign.py")
+        )
+
     def test_allowed_tools_frontmatter_is_low_severity_only(self, tmp_path):
         # Required SKILL.md frontmatter per the agent-skill spec.
         skill_dir = tmp_path / "ok-skill"
