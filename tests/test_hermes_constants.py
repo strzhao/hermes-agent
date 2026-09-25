@@ -640,3 +640,50 @@ class TestProjectVenvDirOutOfTree:
         assert hermes_constants.project_venv_dir(other) is None
         (checkout / ".venv").mkdir()
         assert hermes_constants.project_venv_dir(checkout) == checkout / ".venv"
+
+
+class TestFirstPartyModuleRoots:
+    """Tree-scan completeness: every top-level module/package the repo ships must
+    classify as first-party (issue #122328 — a shipped root missing from
+    FIRST_PARTY_MODULE_ROOTS silently suppresses the half-update hint)."""
+
+    @staticmethod
+    def _shipped_roots(repo_root: Path) -> set[str]:
+        entries = set()
+        for child in repo_root.iterdir():
+            if child.is_file() and child.suffix == ".py" and child.stem != "__init__":
+                entries.add(child.stem)
+            elif child.is_dir() and (child / "__init__.py").is_file():
+                entries.add(child.name)
+        return entries
+
+    #: Deliberately NOT first-party: dev/eval trees that ship in the repo but are
+    #: never imported by runtime code (verified by grep at fix time, #122328). A new
+    #: top-level module/package must either join FIRST_PARTY_MODULE_ROOTS (runtime)
+    #: or this list (dev-only) — the completeness test below forces the decision.
+    DELIBERATELY_EXCLUDED = frozenset({"tests", "evals"})
+
+    def test_every_shipped_top_level_root_is_first_party(self):
+        """The shipped-tree invariant: repo-top modules and packages all resolve True."""
+        repo_root = Path(hermes_constants.__file__).resolve().parent
+        missing = sorted(
+            root for root in self._shipped_roots(repo_root)
+            if root not in self.DELIBERATELY_EXCLUDED
+            and not hermes_constants.is_first_party_module(root)
+        )
+        assert missing == [], (
+            "top-level modules/packages not covered by FIRST_PARTY_MODULE_ROOTS "
+            "or the hermes_ prefix: %s" % missing
+        )
+
+    @pytest.mark.parametrize("root", [
+        "batch_runner", "mcp_serve", "mini_swe_runner", "registration_lifecycle",
+        "setup", "toolset_distributions", "trajectory_compressor", "pm",
+    ])
+    def test_issue_122328_roots_are_first_party(self, root):
+        assert hermes_constants.is_first_party_module(root) is True
+
+    @pytest.mark.parametrize("name", ["agents", "agentops", "setuptools", "tests", "evals"])
+    def test_third_party_and_test_trees_stay_excluded(self, name):
+        """Roots we deliberately do not ship at runtime stay out of the first-party set."""
+        assert hermes_constants.is_first_party_module(name) is False
