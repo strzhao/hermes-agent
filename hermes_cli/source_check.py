@@ -85,9 +85,9 @@ def _git_ok(args: list[str], **kw) -> bool:
     return result is not None and result.returncode == 0
 
 
-def _git_count(args: list[str], *, cwd: Path) -> Optional[int]:
+def _git_count(args: list[str], *, cwd: Path, git: str = "git") -> Optional[int]:
     """``int`` of a successful ``git rev-list --count``-style command, else None."""
-    result = _git_run(args, cwd=cwd)
+    result = _git_run(args, cwd=cwd, git=git)
     if result is not None and result.returncode == 0:
         return _quiet(lambda: int(result.stdout.strip()))
     return None
@@ -477,6 +477,17 @@ def _behind_count(co: _Checkout, target: str) -> tuple[int, list[dict]]:
         ahead = (payload or {}).get("ahead_by")
         if isinstance(ahead, int) and not isinstance(ahead, bool) and ahead >= 0:
             return ahead, (_quiet(lambda: _commits(payload), []) if ahead else [])
+        # When the compare payload is unusable — oversized bodies come back
+        # truncated at the 2 MiB read cap and fail to parse, as do 429 JSON
+        # error pages — a local merge-base still answers the exact count
+        # whenever this checkout holds the target's objects.
+        if not co.embedded and co.head:
+            base = _git_stdout(["merge-base", co.head, target], cwd=co.root, git=co.git)
+            if base:
+                count = _git_count(["rev-list", "--count", f"{base}..{target}"],
+                                   cwd=co.root, git=co.git)
+                if count:
+                    return count, []
     return UPDATE_AVAILABLE_NO_COUNT, []
 
 
