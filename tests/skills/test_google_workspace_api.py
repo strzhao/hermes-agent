@@ -269,3 +269,119 @@ def test_docs_append_carries_tab_id_and_refuses_ambiguous_writes(api_module, mon
         api_module.docs_append(types.SimpleNamespace(doc_id="doc1", text="more", tab=None))
     err = json.loads(capsys.readouterr().err)
     assert "tabs" in err and len(err["tabs"]) == 3
+
+
+# ==========================================================================
+# gmail_search: a successful search with zero hits must still honor the
+# JSON output contract (issue #131711) — both backends print `[]`, never
+# bare text, so `json.loads` consumers see an empty array, not an error.
+# ==========================================================================
+
+
+class _FakeGmailRequest:
+    def __init__(self, result):
+        self._result = result
+
+    def execute(self):
+        return self._result
+
+
+class _FakeGmailService:
+    """Minimal stand-in for the googleapiclient gmail service: ``list()``
+    returns the canned list payload, ``get()`` the canned message payload."""
+
+    def __init__(self, list_result, message_result):
+        self._list_result = list_result
+        self._message_result = message_result
+
+    def users(self):
+        return self
+
+    def messages(self):
+        return self
+
+    def list(self, **kwargs):
+        return _FakeGmailRequest(self._list_result)
+
+    def get(self, **kwargs):
+        return _FakeGmailRequest(self._message_result)
+
+
+def test_gmail_search_fallback_empty_result_prints_json_empty_array(
+    api_module, monkeypatch, capsys
+):
+    """An empty search hit-set is healthy, not an error: the Python fallback
+    must print a JSON empty array on stdout like the gws backend, so a
+    ``json.loads`` consumer gets ``[]`` instead of a parse failure."""
+    monkeypatch.setattr(api_module, "_gws_binary", lambda: None)
+    monkeypatch.setattr(
+        api_module,
+        "build_service",
+        lambda api, version: _FakeGmailService({"messages": []}, {}),
+    )
+    args = types.SimpleNamespace(query="from:nobody@example.com", max=10)
+
+    api_module.gmail_search(args)
+
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed == []
+
+
+def test_gmail_search_gws_backend_empty_result_prints_json_empty_array(
+    api_module, monkeypatch, capsys
+):
+    """Backend parity: the gws branch of the same empty-result search prints
+    ``[]`` — the two backends must not drift on the empty contract."""
+    monkeypatch.setattr(api_module, "_gws_binary", lambda: "/usr/bin/gws")
+    monkeypatch.setattr(
+        api_module,
+        "_run_gws",
+        lambda parts, params=None, body=None: {"messages": []},
+    )
+    args = types.SimpleNamespace(query="from:nobody@example.com", max=10)
+
+    api_module.gmail_search(args)
+
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed == []
+
+
+def test_gmail_search_fallback_nonempty_result_keeps_array_schema(
+    api_module, monkeypatch, capsys
+):
+    """Behavior guard: non-empty results keep the existing array schema
+    (id/threadId/from/to/subject/date/snippet/labels) — the empty-result
+    fix must not disturb it."""
+    monkeypatch.setattr(api_module, "_gws_binary", lambda: None)
+    message = {
+        "id": "m1",
+        "threadId": "t1",
+        "snippet": "hello",
+        "labelIds": ["INBOX"],
+        "payload": {
+            "headers": [
+                {"name": "From", "value": "Alice <alice@example.com>"},
+                {"name": "Subject", "value": "Hi"},
+            ]
+        },
+    }
+    monkeypatch.setattr(
+        api_module,
+        "build_service",
+        lambda api, version: _FakeGmailService(
+            {"messages": [{"id": "m1"}]}, message
+        ),
+    )
+    args = types.SimpleNamespace(query="from:alice@example.com", max=10)
+
+    api_module.gmail_search(args)
+
+    parsed = json.loads(capsys.readouterr().out)
+    assert isinstance(parsed, list) and len(parsed) == 1
+    row = parsed[0]
+    assert set(row) == {
+        "id", "threadId", "from", "to", "subject", "date", "snippet", "labels",
+    }
+    assert row["id"] == "m1"
+    assert row["subject"] == "Hi"
+    assert row["labels"] == ["INBOX"]
