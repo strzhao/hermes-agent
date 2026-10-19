@@ -45,21 +45,36 @@ def _pm_environment_owner(venv: Path) -> Path | None:
 
     Its ``hermes_cli`` is the generation's ``workspace/`` snapshot, which has no ``.git``, so an
     update run from it must go to the checkout (#122627). The install key hashes the checkout
-    path, which proves the path recorded beside it.
+    path, which proves the path recorded beside it — and, when no full install recorded that
+    path, still names the conventional ``<root>/hermes-agent`` checkout beside ``installs/``.
+    A workspace snapshot installed editable outside a PM full install carries only the key, so
+    the unrecorded branch is the one those layouts land in.
     """
     from pm.environments import install_key
 
     state = venv.parent.parent.parent
     if venv.parent.parent.name != "environments":
         return None
+    recorded = _recorded_project_root(state)
+    if recorded is not None:
+        # A full install's record is authoritative: unverified means this state dir is not
+        # the checkout's, and guessing another one would update the wrong tree.
+        trusted = install_key(recorded) == state.name and (recorded / "hermes_cli" / "main.py").is_file()
+        return recorded if trusted else None
+    candidate = state.parent.parent / "hermes-agent"
+    if install_key(candidate) == state.name and (candidate / "hermes_cli" / "main.py").is_file():
+        return candidate
+    return None
+
+
+def _recorded_project_root(state: Path) -> Path | None:
+    """The checkout PM's full install recorded in ``inputs/.project-root`` (``None`` when absent)."""
     try:
         # pm.environments.record_activation_inputs writes it on every full install.
-        owner = Path((state / "inputs" / ".project-root").read_text(encoding="utf-8-sig").strip())
+        recorded = (state / "inputs" / ".project-root").read_text(encoding="utf-8-sig").strip()
     except OSError:
         return None
-    if install_key(owner) != state.name or not (owner / "hermes_cli" / "main.py").is_file():
-        return None
-    return owner
+    return Path(recorded) if recorded else None
 
 
 def retarget_to_owning_install(project_root: Path) -> None:
