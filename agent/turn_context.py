@@ -110,9 +110,12 @@ def _agent_stale_thinking_on_wire(agent: Any) -> bool:
 def compose_multimodal_context_part(
     ext_prefetch_cache: str, plugin_user_context: str,
 ) -> Optional[str]:
-    """The ephemeral context of one turn (memory prefetch + ``pre_llm_call``) as one text
-    block; ``None`` when nothing is injected. The string sidecar appends it to ``content``;
-    a multimodal (list) turn carries it as a durable text part (#71998)."""
+    """The API-time context of one turn (memory prefetch + durable ``pre_llm_call``) as one
+    text block; ``None`` when nothing is injected. It is injected at API time but persisted
+    via the sidecar and replayed (#143739 renames the other kind: a hook result with
+    ``ephemeral: true`` is sent-but-not-saved and never reaches this composition). The
+    string sidecar appends it to ``content``; a multimodal (list) turn carries it as a
+    durable text part (#71998)."""
     fenced = build_memory_context_block(ext_prefetch_cache) if ext_prefetch_cache else ""
     injections = [part for part in (fenced, plugin_user_context) if part]
     return "\n\n".join(injections) if injections else None
@@ -502,6 +505,10 @@ class TurnContext:
     current_turn_user_idx: int  # index of the current user turn within ``messages``
     should_review_memory: bool = False  # post-turn memory review should fire
     plugin_user_context: str = ""  # ``pre_llm_call`` context (appended to user message)
+    # Sent-but-not-saved ``pre_llm_call`` context (``{"context": ..., "ephemeral": true}``):
+    # rides this turn's wire bytes only — excluded from the api_content sidecar, so it is
+    # never persisted nor replayed.
+    ephemeral_user_context: str = ""
     ext_prefetch_cache: str = ""  # external-memory prefetch, reused across iterations
     preflight_compression_blocked: bool = False  # immediate retry proved ineffective
 
@@ -799,12 +806,16 @@ def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: list[Any], conversation_history: Optional[list[Any]],
-) -> str:
+) -> tuple[str, str]:
     """Run ``pre_llm_call`` plugins; their context is injected into the user message
-    (never the system prompt). Oversized per-hook context is spilled to disk so a
-    runaway plugin can't inflate every subsequent turn's prompt."""
+    (never the system prompt). Returns ``(durable, ephemeral)``: the durable stream is
+    stamped into the ``api_content`` sidecar (persisted + replayed); a dict result with
+    ``"ephemeral": true`` is sent-but-not-saved — on this turn's wire bytes only, never
+    persisted nor replayed. Bare strings and unknown shapes fail open into the durable
+    bucket. Oversized per-hook context is spilled to disk so a runaway plugin can't
+    inflate every subsequent turn's prompt."""
     if getattr(agent, "_persist_disabled", False):
-        return ""
+        return "", ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -830,12 +841,15 @@ def _collect_pre_llm_call_context(
         except Exception:
             _spill_if_oversized = None  # type: ignore[assignment]
             _spill_config_cached = None
-        _ctx_parts: list[str] = []
+        _durable_parts: list[str] = []
+        _ephemeral_parts: list[str] = []
         for r in _pre_results:
             if isinstance(r, dict) and r.get("context"):
                 _piece = str(r["context"])
+                _ephemeral = bool(r.get("ephemeral"))
             elif isinstance(r, str) and r.strip():
                 _piece = r
+                _ephemeral = False
             else:
                 continue
             if _spill_if_oversized is not None:
@@ -846,11 +860,11 @@ def _collect_pre_llm_call_context(
                     )
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
-            _ctx_parts.append(_piece)
-        return "\n\n".join(_ctx_parts)
+            (_ephemeral_parts if _ephemeral else _durable_parts).append(_piece)
+        return "\n\n".join(_durable_parts), "\n\n".join(_ephemeral_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
-    return ""
+    return "", ""
 
 
 def _merge_gateway_notes(
@@ -1179,7 +1193,7 @@ def build_turn_context(
     conversation_history = compaction.conversation_history
     current_turn_user_idx = compaction.current_turn_user_idx
 
-    plugin_user_context = _collect_pre_llm_call_context(
+    plugin_user_context, ephemeral_user_context = _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history,
@@ -1187,6 +1201,8 @@ def build_turn_context(
     # Every turn, not only on a prompt restore: a long-lived agent (CLI, TUI, Desktop) keeps its
     # prompt in memory for the whole conversation and would never re-check its skills index.
     stage_skills_index_note(agent, active_system_prompt, messages)
+    # Gateway must-deliver notes are durable: they merge into the durable stream only,
+    # so the sent-but-not-saved bucket stays free of anything owed a later replay.
     plugin_user_context = _merge_gateway_notes(
         agent, messages, current_turn_user_idx, plugin_user_context
     )
@@ -1219,7 +1235,8 @@ def build_turn_context(
         conversation_history=conversation_history, active_system_prompt=active_system_prompt,
         effective_task_id=effective_task_id, turn_id=turn_id,
         current_turn_user_idx=current_turn_user_idx, should_review_memory=should_review_memory,
-        plugin_user_context=plugin_user_context, ext_prefetch_cache=ext_prefetch_cache,
+        plugin_user_context=plugin_user_context, ephemeral_user_context=ephemeral_user_context,
+        ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=compaction.blocked,
     )
 
@@ -1246,6 +1263,7 @@ def _sanitize_model_for(agent: Any, moa_config: Any) -> Any:
 def build_api_messages(
     agent: Any, messages: list[dict[str, Any]], *, current_turn_user_idx: Any,
     ext_prefetch_cache: Any, plugin_user_context: Any, moa_config: Any, active_system_prompt: Any,
+    ephemeral_user_context: str = "",
 ) -> tuple[list[dict[str, Any]], str]:
     """Build the wire copy of ``messages`` for one API call plus the effective system
     message. Returns ``(api_messages, effective_system)``.
@@ -1253,10 +1271,13 @@ def build_api_messages(
     Prompt-cache invariant: historical user/assistant rows replay their ``api_content``
     sidecar (the exact bytes sent live) so the prefix stays byte-stable; the current
     user turn reuses the prologue's stamp (or composes live when a caller bypassed the
-    prologue). Ephemeral context (prefetch, ``pre_llm_call`` hooks,
-    ``ephemeral_system_prompt``) is added at API time only — ``messages`` stays untouched
-    beyond the sidecar stamp, and the system prompt is built ONCE per session and
-    replayed verbatim."""
+    prologue). Injected context (memory prefetch, ``pre_llm_call`` hooks,
+    ``ephemeral_system_prompt``) is added at API time only and is persisted via the
+    sidecar so later turns replay it verbatim — ``messages`` stays untouched beyond the
+    sidecar stamp, and the system prompt is built ONCE per session and replayed
+    verbatim. The exception is ``ephemeral_user_context`` (a hook's sent-but-not-saved
+    context): appended to this turn's wire copy after the durable stream, never stamped,
+    so it is neither persisted nor replayed."""
     from agent.agent_runtime_helpers import fill_empty_non_final_wire_payload
     from agent.conversation_loop import _clone_message_for_send
     from agent.replay_cleanup import canonicalize_replay_history
@@ -1305,6 +1326,18 @@ def build_api_messages(
                 )
                 if _composed is not None:
                     api_msg["content"] = _composed
+            if ephemeral_user_context:
+                # Sent-but-not-saved hook context: wire-only, trailing the durable
+                # stream. The sidecar above excludes it, so it is never persisted
+                # nor replayed; the fresh per-iteration clone keeps bytes identical
+                # across this turn's API calls.
+                _wire_content = api_msg.get("content")
+                if isinstance(_wire_content, str):
+                    api_msg["content"] = _wire_content + "\n\n" + ephemeral_user_context
+                elif isinstance(_wire_content, list):
+                    api_msg["content"] = [
+                        *_wire_content, {"type": "text", "text": ephemeral_user_context}
+                    ]
         elif (
             isinstance(_api_content, str) and _api_content
             and msg.get("role") in ("user", "assistant")

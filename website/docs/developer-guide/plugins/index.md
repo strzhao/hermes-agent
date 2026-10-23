@@ -1542,20 +1542,25 @@ The **API request hooks** are observers for the raw provider request, one level 
 
 This is the only hook whose return value matters. When a `pre_llm_call` callback returns a dict with a `"context"` key (or a plain string), Hermes injects that text into the **current turn's user message**. This is the mechanism for memory plugins, RAG integrations, guardrails, and any plugin that needs to provide the model with additional context.
 
+By default the injection is durable: it is sent this turn **and** stamped into the row's `api_content` sidecar, so later turns replay it verbatim (persist-what-you-send). A dict result may instead set `"ephemeral": true` for **sent-but-not-saved** semantics: the model still sees the text on every API call of this turn (trailing any durable injection), but it never reaches the sidecar — it is not persisted, not replayed on later turns, and stays invisible to memory review and compaction, which read the clean transcript.
+
 #### Return format
 
 ```python
-# Dict with context key
+# Dict with context key (durable: sent now, persisted, replayed later)
 return {"context": "Recalled memories:\n- User prefers dark mode\n- Last project: hermes-agent"}
 
-# Plain string (equivalent to the dict form above)
+# Sent-but-not-saved: sent this turn only, never persisted nor replayed
+return {"context": "Live dashboards: error-rate 2.1%, p99 840ms", "ephemeral": True}
+
+# Plain string (equivalent to the durable dict form above)
 return "Recalled memories:\n- User prefers dark mode"
 
 # Return None or don't return → no injection (observer-only)
 return None
 ```
 
-Any non-None, non-empty return with a `"context"` key (or a plain non-empty string) is collected and appended to the user message for the current turn.
+Any non-None, non-empty return with a `"context"` key (or a plain non-empty string) is collected and appended to the user message for the current turn. `ephemeral` is only read on the dict form; anything falsy or missing means durable, and unrecognized result shapes fail open into the durable path.
 
 #### Oversized-context spill
 
@@ -1647,7 +1652,11 @@ def register(ctx):
 
 #### Multiple plugins returning context
 
-When multiple plugins return context from `pre_llm_call`, their outputs are joined with double newlines and appended to the user message together. The order follows plugin discovery order (alphabetical by plugin directory name).
+When multiple plugins return context from `pre_llm_call`, their outputs are joined with double newlines and appended to the user message together. The order follows plugin discovery order (alphabetical by plugin directory name). Durable results form one consecutive block exactly as before; sent-but-not-saved (`"ephemeral": true`) results join into a second block that trails it.
+
+:::note Cost of sent-but-not-saved
+Because an ephemeral injection is absent from the persisted row, the next turn's prompt diverges from this turn's bytes at that row — the row's prompt-cache prefix cannot be reused. That is the inherent price of not leaving a trace; opt in per hook result, and keep high-frequency injections durable.
+:::
 
 ### Middleware: change what happens
 
