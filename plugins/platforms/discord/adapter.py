@@ -6564,6 +6564,7 @@ def _define_discord_view_classes() -> None:
                 logger.error("Failed to resolve gateway approval from button: %s", exc)
                 count = 0
             if not count:
+                self._backend_settled = False
                 color = discord.Color.dark_grey()
                 label = t("platform.discord.approval.expired")
             try:

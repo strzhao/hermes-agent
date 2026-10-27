@@ -169,3 +169,54 @@ async def test_timeout_edits_cannot_restore_buttons_or_pending_embed(monkeypatch
     assert state["view"] is None
     assert state["embed"].color != pending_color
     assert view.is_finished()
+
+
+@pytest.mark.asyncio
+async def test_external_answer_then_stale_click_preserves_resolved_observer(monkeypatch):
+    """A no-op stale click must not suppress the externally resolved observer."""
+    adapter = discord_adapter.DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+    monkeypatch.setattr(discord_adapter.discord.Color, "dark_grey", lambda: 8, raising=False)
+    adapter._allowed_user_ids = {"42"}
+    session = "agent:other:discord:555"
+    entry = _ApprovalEntry({"request_id": "request-1", "command": "ls"})
+    monkeypatch.setitem(approval._gateway_queues, session, [entry])
+    message = SimpleNamespace(id=1234, edit=AsyncMock(), embeds=[])
+    sent = {}
+
+    async def send(**kwargs):
+        sent.update(kwargs)
+        message.embeds = [kwargs["embed"]]
+        return message
+
+    channel = SimpleNamespace(send=send, get_partial_message=lambda _id: message)
+    adapter._client = SimpleNamespace(get_channel=lambda _id: channel)
+    await adapter.send_exec_approval(
+        chat_id="555", command="ls", session_key=session,
+        metadata={"_approval_request_id": "request-1"},
+    )
+    view = sent["view"]
+
+    async def interaction_edit(**kwargs):
+        message.embeds = [kwargs["embed"]]
+
+    interaction = SimpleNamespace(
+        message=message,
+        user=SimpleNamespace(id=42, display_name="tester"),
+        response=SimpleNamespace(
+            edit_message=AsyncMock(side_effect=interaction_edit),
+            send_message=AsyncMock(),
+        ),
+    )
+
+    assert approval.resolve_gateway_approval(session, "once", request_id="request-1") == 1
+    assert entry.result == "once"
+    entry.observers[0]("resolved")  # the waiter thread schedules the resolved observer
+    assert not view.resolved, "the resolved observer has not run; the old button is still active"
+
+    await view._resolve(interaction, "once", 2, "platform.discord.approval.resolved_once")
+    await asyncio.sleep(0)  # let the observer's call_soon_threadsafe callback enqueue retirement
+    await asyncio.gather(*adapter._background_tasks)
+
+    footer = message.embeds[0].footer
+    footer_text = footer["text"] if isinstance(footer, dict) else footer.text
+    assert footer_text == t("platform.discord.approval.already_resolved")
