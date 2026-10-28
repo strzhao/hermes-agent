@@ -91,7 +91,7 @@ def _baseline_reclaims(*, pid_alive_at_event, fingerprint_read, recorded):
     return fingerprint_read is None or fingerprint_read != recorded
 
 
-def replay(events, monkeypatch_fingerprint, confirm_seconds: str):
+def replay(events, monkeypatch_fingerprint):
     """Two ticks per recorded event against the patched module. Returns per-event verdicts."""
     import os
 
@@ -197,7 +197,6 @@ def main() -> int:
     ap.add_argument("--classification", required=True, type=Path)
     ap.add_argument("--out", type=Path, default=Path("replay_result.json"))
     ap.add_argument("--burst", nargs=2, default=list(DEFAULT_BURST), metavar=("FROM", "TO"))
-    ap.add_argument("--confirm-seconds", default="60")
     args = ap.parse_args()
 
     import os
@@ -214,7 +213,6 @@ def main() -> int:
     root.mkdir(parents=True, exist_ok=True)
     os.environ["HERMES_HOME"] = str(root)
     os.environ["HERMES_KANBAN_CRASH_GRACE_SECONDS"] = "0"
-    os.environ["HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS"] = args.confirm_seconds
 
     from hermes_cli import kanban_db_dispatch as kbd
 
@@ -228,7 +226,7 @@ def main() -> int:
     def _inject(failing: bool):
         kbd._process_fingerprint = (lambda pid: None) if failing else real_fp
 
-    replay(events, _inject, args.confirm_seconds)
+    replay(events, _inject)
     control = replay_true_deaths(events, _inject)
 
     live = [e for e in events if e["alive_at_reclaim"]]

@@ -6,8 +6,11 @@ hiccup on a loaded dispatch host released the claim and counted a failure (42 of
 alive' reclaims were exactly that; heartbeats were 2-70 s fresh and are never consulted here).
 
 The fix splits the question into verdicts: only a PROVEN recycle (MISMATCH) or a GONE pid may
-book a crash; a live-but-UNREADABLE worker is held across a confirmation window (two probes) and
-is never signalled — missing identity is refusal, not permission (#99558).
+book a crash. An UNREADABLE verdict is an unknown, never evidence: the card is held for as long
+as the unreadability lasts — no confirmation window and no amount of elapsed time converts it
+into a death — and it is never signalled (missing identity is refusal, not permission, #99558).
+The sighting ledger observes how long THIS pid/fingerprint incarnation has been unreadable; it
+never authorises a crash, and stale memory never vouches for an incarnation it did not see.
 """
 
 import json
@@ -28,8 +31,6 @@ from hermes_cli import kanban_db_dispatch as kbd
 def board(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-    # Default: the pre-fix single-probe contract; hold tests opt into a window explicitly.
-    monkeypatch.setenv("HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS", "0")
     kbd._DEAD_PROBE_MEMORY.clear()
     conn = kbc.connect(tmp_path / "kanban.db")
     try:
@@ -69,11 +70,22 @@ def _dead_pid() -> int:
     return proc.pid
 
 
+def _live_child() -> subprocess.Popen:
+    """A real live process that is not this test (a stand-in worker incarnation)."""
+    return subprocess.Popen([sys.executable, "-c", "import threading; threading.Event().wait()"])
+
+
 def _ledger_entry(conn, task_id):
     path = kbd._dead_probe_ledger_path(None)
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8")).get(task_id)
+
+
+def _rewrite_ledger(conn, task_id, entry) -> None:
+    path = kbd._dead_probe_ledger_path(None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({task_id: entry}), encoding="utf-8")
 
 
 # --- verdict semantics -------------------------------------------------------
@@ -84,9 +96,6 @@ def test_unreadable_fingerprint_reads_as_alive(board, monkeypatch):
     the claim is extended, not reclaimed, and nothing is signalled."""
     conn = board
     killed: list = []
-    # A closed confirmation window: the default here is the single-probe escape hatch, and this
-    # test is about what a transient must NOT do (reclaim / signal) while it is unconfirmed.
-    monkeypatch.setenv("HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS", "3600")
     tid = _running_with_pid(conn, pid=os.getpid(), started_at="9e-fake|123456789")
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
 
@@ -135,103 +144,133 @@ def test_gone_pid_reclaims_immediately(board):
     assert kb.get_task(conn, tid).status == "ready"
 
 
-# --- two-probe confirmation ----------------------------------------------------
+# --- an unknown verdict is never death evidence ---------------------------------
 
 
-def test_unreadable_worker_is_held_then_reclaimed_on_confirmation(board, monkeypatch):
-    """One transient read failure defers the reclaim; the second verdict past the confirmation
-    window books it, with probe diagnostics on the event."""
+def test_persistent_unreadable_sightings_are_never_booked(board, monkeypatch):
+    """Two UNREADABLE verdicts are two unknowns, not a death: no amount of elapsed time converts
+    an unreadable identity into crash evidence — only this tick's GONE/MISMATCH may book."""
     conn = board
-    monkeypatch.setenv("HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS", "3600")
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
     tid = _running_with_pid(conn, pid=os.getpid(), started_at="9e-fake|123456789")
 
-    assert kbd.detect_crashed_workers(conn) == []          # tick 1: hold
+    assert kbd.detect_crashed_workers(conn) == []           # tick 1: hold
     assert kb.get_task(conn, tid).status == "running"
-    assert _ledger_entry(conn, tid) is not None
-    assert kbd.detect_crashed_workers(conn) == []          # tick 2 inside the window: still held
-    assert kb.get_task(conn, tid).status == "running"
-
-    # Age the hold past the window (what tick N+1 ~60 s later amounts to).
     entry = _ledger_entry(conn, tid)
-    entry["first_seen"] = time.time() - 3601
-    path = kbd._dead_probe_ledger_path(None)
-    path.write_text(json.dumps({tid: entry}), encoding="utf-8")
+    assert entry is not None
+    entry["first_seen"] = time.time() - 3601                # an hour of unreadability
+    _rewrite_ledger(conn, tid, entry)
 
-    assert kbd.detect_crashed_workers(conn) == [tid]       # confirmed: book it
-    assert kb.get_task(conn, tid).status == "ready"
-    assert _ledger_entry(conn, tid) is None                # hold consumed
-
-    events = [e for e in kb.list_events(conn, tid) if e.kind == "crashed"]
-    assert events, [e.kind for e in kb.list_events(conn, tid)]
-    probe = events[-1].payload["probe"]
-    assert probe["recorded"] == "9e-fake|123456789"
-    assert probe["recomputed"] is None
-    assert probe["read_failure"] == "fingerprint_unreadable"
+    assert kbd.detect_crashed_workers(conn) == []           # still unknown → still held
+    task = kb.get_task(conn, tid)
+    assert task.status == "running" and task.worker_pid is not None
 
 
-def test_read_recovery_drops_the_hold(board, monkeypatch):
+def test_read_recovery_drops_the_sighting(board, monkeypatch):
     """When the birth read recovers and matches, the worker is simply alive: no crash was ever
-    booked and the stale hold is dropped."""
+    booked and the stale sighting is dropped."""
     conn = board
-    monkeypatch.setenv("HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS", "3600")
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
     real = _real_fingerprint(os.getpid())
     tid = _running_with_pid(conn, pid=os.getpid(), started_at=real)
-    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
 
     assert kbd.detect_crashed_workers(conn) == []
     assert _ledger_entry(conn, tid) is not None
 
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: _real_fingerprint(pid))
-    assert kbd.detect_crashed_workers(conn) == []          # alive again: nothing to book
+    assert kbd.detect_crashed_workers(conn) == []           # alive again: nothing to book
     task = kb.get_task(conn, tid)
     assert task.status == "running" and task.worker_pid is not None
-    assert _ledger_entry(conn, tid) is None                # hold dropped on recovery
+    assert _ledger_entry(conn, tid) is None                 # sighting dropped on recovery
 
 
-def test_confirmation_survives_a_fresh_dispatcher_process(board, monkeypatch):
-    """The ledger is on disk: a separate ``hermes kanban dispatch`` process (empty memory) can
-    confirm the previous tick's hold."""
+def test_lost_disk_ledger_memory_never_vouches_for_a_new_incarnation(board, monkeypatch):
+    """A disk ledger lost to cleanup/corruption must not let in-process memory of a PREVIOUS
+    incarnation answer for the new worker's first unreadable sighting: the note restarts."""
     conn = board
-    monkeypatch.setenv("HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS", "3600")
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
+    child = _live_child()
+    try:
+        tid = _running_with_pid(conn, pid=child.pid, started_at="9e-fake|777")
+        # The only record of THIS incarnation was the disk row, and it is gone; the surviving
+        # in-process memory belongs to an OLDER incarnation of the same task (61 s stale, foreign
+        # pid/fingerprint).
+        kbd._DEAD_PROBE_MEMORY[tid] = (time.time() - 3601, 4242, "stale")
+        now = time.time()
+
+        assert kbd.detect_crashed_workers(conn) == []       # hold — never booked on sighting one
+        task = kb.get_task(conn, tid)
+        assert task.status == "running" and task.worker_pid is not None
+        entry = _ledger_entry(conn, tid)
+        assert entry is not None
+        assert entry["pid"] == child.pid and entry["fingerprint"] == "9e-fake|777"
+        assert entry["first_seen"] == pytest.approx(now, abs=10)  # restarted, not vouched
+    finally:
+        child.kill()
+        child.wait(timeout=15)
+
+
+def test_disk_row_loss_same_incarnation_memory_keeps_the_age(board, monkeypatch):
+    """When the disk row is lost but in-process memory saw the SAME incarnation, the note keeps
+    its age: first_seen is a property of the incarnation, not of the last write."""
+    conn = board
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
+    tid = _running_with_pid(conn, pid=os.getpid(), started_at="9e-fake|123456789")
+
+    assert kbd.detect_crashed_workers(conn) == []
+    kbd._dead_probe_ledger_path(None).unlink(missing_ok=True)
+    aged = time.time() - 30
+    kbd._DEAD_PROBE_MEMORY[tid] = (aged, os.getpid(), "9e-fake|123456789")
+
+    assert kbd.detect_crashed_workers(conn) == []
+    entry = _ledger_entry(conn, tid)
+    assert entry is not None
+    assert entry["first_seen"] == pytest.approx(aged, abs=5)
+
+
+def test_stale_sighting_for_a_previous_incarnation_is_renoted(board, monkeypatch):
+    """A sighting recorded against an older pid/fingerprint must not answer for the current
+    worker: its first sighting restarts the note against THIS incarnation."""
+    conn = board
+    tid = _running_with_pid(conn, pid=os.getpid(), started_at="9e-fake|123456789")
+    old = {"first_seen": time.time() - 9999, "pid": 4242, "fingerprint": "old"}
+    _rewrite_ledger(conn, tid, old)
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
+
+    assert kbd.detect_crashed_workers(conn) == []           # re-noted against THIS incarnation
+    entry = _ledger_entry(conn, tid)
+    assert entry["pid"] == os.getpid() and entry["fingerprint"] == "9e-fake|123456789"
+
+
+def test_same_incarnation_sighting_preserves_first_seen(board, monkeypatch):
+    """A sub-minute tick must not reset the sighting's age: first_seen is preserved while the
+    pid/fingerprint keep matching (a high-frequency ticker could otherwise defer forever)."""
+    conn = board
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
     tid = _running_with_pid(conn, pid=os.getpid(), started_at="9e-fake|123456789")
 
     assert kbd.detect_crashed_workers(conn) == []
     entry = _ledger_entry(conn, tid)
-    entry["first_seen"] = time.time() - 3601
-    kbd._dead_probe_ledger_path(None).write_text(json.dumps({tid: entry}), encoding="utf-8")
-    kbd._DEAD_PROBE_MEMORY.clear()                          # simulated new process
+    aged = time.time() - 30
+    entry["first_seen"] = aged
+    _rewrite_ledger(conn, tid, entry)
 
-    assert kbd.detect_crashed_workers(conn) == [tid]
-
-
-def test_stale_hold_for_a_previous_incarnation_never_confirms(board, monkeypatch):
-    """A hold recorded against an older pid/fingerprint must not confirm the current worker's
-    verdict at its first sighting."""
-    conn = board
-    monkeypatch.setenv("HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS", "3600")
-    tid = _running_with_pid(conn, pid=os.getpid(), started_at="9e-fake|123456789")
-    old = {"first_seen": time.time() - 9999, "pid": 4242, "fingerprint": "old"}
-    kbd._dead_probe_ledger_path(None).parent.mkdir(parents=True, exist_ok=True)
-    kbd._dead_probe_ledger_path(None).write_text(json.dumps({tid: old}), encoding="utf-8")
-    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
-
-    assert kbd.detect_crashed_workers(conn) == []          # re-noted against THIS incarnation
+    assert kbd.detect_crashed_workers(conn) == []
     entry = _ledger_entry(conn, tid)
-    assert entry["pid"] == os.getpid() and entry["fingerprint"] == "9e-fake|123456789"
+    assert entry["first_seen"] == pytest.approx(aged, abs=5)
 
 
-def test_window_zero_restores_single_probe_booking(board, monkeypatch):
-    """The escape hatch (tests / operators) books an unreadable dead verdict on one tick, and the
-    event still carries the probe diagnostics."""
-    conn = board
-    monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
-    tid = _running_with_pid(conn, pid=os.getpid(), started_at="9e-fake|123456789")
+def test_darwin_ps_failure_keeps_the_kill_zero_answer(board, monkeypatch):
+    """A darwin ``ps`` stat probe that fails (non-zero rc) keeps the kill(0) positive answer,
+    like the timeout branch: ps failing to READ a process is not evidence that it exited."""
+    from gateway import status
 
-    assert kbd.detect_crashed_workers(conn) == [tid]
-    events = [e for e in kb.list_events(conn, tid) if e.kind == "crashed"]
-    assert events and events[-1].payload["probe"]["read_failure"] == "fingerprint_unreadable"
+    def broken_run(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], returncode=1, stdout="", stderr="")
+
+    monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+    monkeypatch.setattr(subprocess, "run", broken_run)
+    assert kbd._pid_alive(os.getpid()) is True
 
 
 # --- signal safety on the unreadable path -------------------------------------
@@ -256,9 +295,8 @@ def test_termination_refuses_unreadable_identity(board, monkeypatch):
 
 def test_timeout_path_never_signals_an_unreadable_worker(board, monkeypatch):
     """max-runtime enforcement over a live-but-unreadable worker: no SIGTERM, no SIGKILL, the card
-    stays held for the reclaim sweep to confirm."""
+    stays held until the identity reads again or the pid exits."""
     conn = board
-    monkeypatch.setenv("HERMES_KANBAN_DEAD_PROBE_CONFIRM_SECONDS", "3600")
     monkeypatch.setattr(kbd, "_process_fingerprint", lambda pid: None)
     killed: list = []
     tid = _running_with_pid(
@@ -267,3 +305,19 @@ def test_timeout_path_never_signals_an_unreadable_worker(board, monkeypatch):
     assert kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig))) == []
     assert killed == []
     assert kb.get_task(conn, tid).status == "running"
+
+
+def test_max_runtime_still_signals_a_gone_worker(board):
+    """A max-runtime overrun whose worker is verifiably GONE keeps the old contract's harmless
+    SIGTERM attempt (the raised ProcessLookupError is suppressed) and is booked: a dead pid is
+    not an identity hazard. Control for tests/hermes_cli/test_kanban_core_functionality.py."""
+    conn = board
+    killed: list = []
+    gone = _dead_pid()
+    tid = _running_with_pid(conn, pid=gone, started_at="9e-fake|123456789", max_runtime=1)
+
+    assert kbd.enforce_max_runtime(
+        conn, signal_fn=lambda pid, sig: killed.append((pid, sig)),
+    ) == [tid]
+    assert killed == [(gone, signal.SIGTERM)]
+    assert kb.get_task(conn, tid).status == "ready"
