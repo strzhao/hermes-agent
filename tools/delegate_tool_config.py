@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any, Dict, List, NamedTuple, Optional
+from urllib.parse import urlsplit
 from utils import base_url_hostname, is_truthy_value
 from hermes_cli.fallback_config import scoped_fallback_chain
 
@@ -179,6 +180,36 @@ def _get_inherit_mcp_toolsets() -> bool:
 def _normalized_runtime_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
+def _same_credential_endpoint(candidate: Any, canonical: Any) -> bool:
+    """Whether two endpoint URLs denote the same service, for the inherit-the-parent's-key guard.
+
+    Normalised comparison, fail-closed: equality requires the same http(s) scheme, hostname
+    (stdlib lowercases it), effective port (implicit 80/443 folded), path (``rstrip("/")``
+    only — case preserved), query and userinfo (``.hostname`` strips userinfo, so
+    ``evil.example@host`` must not pass as ``host``). Anything unparseable — a non-string, a
+    relative URL, a non-http(s) scheme, a missing hostname, an invalid port — falls back to
+    exact string equality, so this only ever widens ``==`` for provably same-service URLs.
+    """
+    if not (isinstance(candidate, str) and isinstance(canonical, str)):
+        return candidate == canonical
+
+    def _effective_port(parts) -> int:
+        return parts.port if parts.port is not None else (80 if parts.scheme == "http" else 443)
+
+    try:
+        a, b = urlsplit(candidate), urlsplit(canonical)
+        if a.scheme != b.scheme or a.scheme not in ("http", "https"):
+            return candidate == canonical
+        if a.hostname is None or b.hostname is None:
+            return candidate == canonical
+        if a.hostname != b.hostname or _effective_port(a) != _effective_port(b):
+            return False
+        if a.path.rstrip("/") != b.path.rstrip("/") or a.query != b.query:
+            return False
+        return (a.username, a.password) == (b.username, b.password)
+    except ValueError:
+        return candidate == canonical
+
 def _inherit_parent_capabilities(parent_agent, override_provider, override_base_url) -> Optional[dict]:
     """Parent's endpoint-trust capability map for a child, or None. ``agent.capabilities`` is a trust decision scoped
     to one provider+endpoint: inherited ONLY when the child runs the parent's exact route; any provider or base_url
@@ -239,7 +270,9 @@ def _refuse_unkeyed_foreign_endpoint(creds: dict, parent_agent: Any) -> None:
         return
     child_url = _normalized_runtime_url(creds.get("base_url"))
     parent_url = _parent_endpoint_url(parent_agent)
-    if not child_url or not parent_url or child_url == parent_url:
+    if not child_url or not parent_url:
+        return
+    if child_url and parent_url and _same_credential_endpoint(child_url, parent_url):
         return
     raise ValueError(
         f"Delegation route '{child_url}' is configured without a credential, and the parent's key "

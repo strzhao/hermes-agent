@@ -78,3 +78,104 @@ def test_routes_for_turns_the_refusal_into_a_tool_error():
     )
     assert routes == []
     assert error and "refusing to send it to a different host" in error
+
+
+# ---------------------------------------------------------------------------
+# same-service endpoint identity: URL spellings of ONE service keep inheriting,
+# anything not provably the same service still refuses (fail-closed).
+# ---------------------------------------------------------------------------
+
+def test_same_service_host_case_keeps_inheriting():
+    creds = _resolve_delegation_credentials(_cfg(base_url="https://API.Anthropic.COM"), _parent())
+    assert creds["api_key"] is None
+
+
+def test_same_service_https_default_port_keeps_inheriting():
+    creds = _resolve_delegation_credentials(_cfg(base_url="https://api.anthropic.com:443"), _parent())
+    assert creds["api_key"] is None
+
+
+def test_same_service_http_default_port_with_path_keeps_inheriting():
+    creds = _resolve_delegation_credentials(
+        _cfg(base_url="http://127.0.0.1:80/v1"),
+        _parent(base_url="http://127.0.0.1/v1"),
+    )
+    assert creds["api_key"] is None
+
+
+def test_different_scheme_still_refuses():
+    with pytest.raises(ValueError, match="refusing to send it to a different host"):
+        _resolve_delegation_credentials(_cfg(base_url="http://api.anthropic.com"), _parent())
+
+
+def test_non_default_port_still_refuses():
+    with pytest.raises(ValueError, match="refusing to send it to a different host"):
+        _resolve_delegation_credentials(_cfg(base_url="https://api.anthropic.com:8443"), _parent())
+
+
+def test_userinfo_spoofing_still_refuses():
+    """``.hostname`` strips userinfo — ``evil.example@host`` must not pass as ``host``."""
+    with pytest.raises(ValueError, match="refusing to send it to a different host"):
+        _resolve_delegation_credentials(_cfg(base_url="https://evil.example@api.anthropic.com"), _parent())
+
+
+def test_different_path_still_refuses():
+    with pytest.raises(ValueError, match="refusing to send it to a different host"):
+        _resolve_delegation_credentials(_cfg(base_url="https://api.anthropic.com/v2"), _parent())
+
+
+def test_different_query_still_refuses():
+    with pytest.raises(ValueError, match="refusing to send it to a different host"):
+        _resolve_delegation_credentials(_cfg(base_url="https://api.anthropic.com?key=fake"), _parent())
+
+
+def _same(candidate, canonical):
+    from tools.delegate_tool_config import _same_credential_endpoint
+    return _same_credential_endpoint(candidate, canonical)
+
+
+def test_helper_accepts_trailing_slash_and_default_ports():
+    assert _same("https://Host/Path/", "https://host/Path") is True
+    assert _same("https://host/", "https://host") is True
+    assert _same("https://host:443", "https://host") is True
+    assert _same("http://host:80/v1", "http://host/v1") is True
+
+
+def test_helper_rejects_path_case_and_cross_scheme():
+    assert _same("https://host/V1", "https://host/v1") is False
+    assert _same("http://host/v1", "https://host/v1") is False
+
+
+def test_helper_rejects_query_and_userinfo_differences():
+    assert _same("https://host/v1?x=1", "https://host/v1") is False
+    assert _same("https://host/v1?x=1", "https://host/v1?x=1") is True
+    assert _same("https://evil.example@host/v1", "https://host/v1") is False
+    assert _same("https://u:p@host/v1", "https://u:p@host/v1") is True
+
+
+def test_helper_falls_back_for_relative_urls():
+    assert _same("example.com/v1", "example.com/v1") is True
+    assert _same("example.com/v1", "example.com/v2") is False
+
+
+def test_helper_falls_back_on_illegal_port():
+    assert _same("https://host:99999/v1", "https://host:99999/v1") is True
+    assert _same("https://host:99999/v1", "https://host/v1") is False
+    assert _same("https://host:notaport/v1", "https://host/v1") is False
+
+
+def test_helper_falls_back_on_malformed_url_without_raising():
+    assert _same("https://[::1/v1", "https://host/v1") is False
+    assert _same("https://[::1/v1", "https://[::1/v1") is True
+
+
+def test_helper_falls_back_for_non_string_inputs():
+    assert _same(None, None) is True
+    assert _same(None, "https://host/v1") is False
+    assert _same(123, 123) is True
+    assert _same(123, "https://host/v1") is False
+
+
+def test_helper_falls_back_when_hostname_is_missing():
+    assert _same("https:///v1", "https://host/v1") is False
+    assert _same("https:///v1", "https:///v1") is True

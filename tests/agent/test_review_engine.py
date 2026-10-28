@@ -120,6 +120,7 @@ def test_load_review_credentials_cfg_reads_config(monkeypatch):
         "api_key": "",
         "api_mode": "",
         "key_env": "",
+        "api_key_env": "",
     }
 
 def test_load_review_credentials_cfg_keeps_key_env(monkeypatch):
@@ -137,6 +138,80 @@ def test_load_review_credentials_cfg_keeps_key_env(monkeypatch):
     cfg = re_mod._load_review_credentials_cfg()
     assert cfg["key_env"] == "CLIPROXY_API_KEY"
     assert cfg["base_url"] == "http://127.0.0.1:8317/v1"
+
+def test_load_review_credentials_cfg_keeps_api_key_env_alias(monkeypatch):
+    """`api_key_env` is the second accepted spelling of the same pointer contract
+    (``_route_credential_pointer`` reads both); dropping it on the /review hop would
+    strand alias-configured routes on parent-key inheritance."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"review": {
+            "provider": "cliproxy",
+            "model": "gemini-4-argon-high",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key_env": "CLIPROXY_API_KEY",
+        }}},
+    )
+    cfg = re_mod._load_review_credentials_cfg()
+    assert cfg["api_key_env"] == "CLIPROXY_API_KEY"
+    assert cfg["base_url"] == "http://127.0.0.1:8317/v1"
+
+
+def _credential_parent(base_url="https://api.anthropic.com", api_key="«redacted:sk-…»"):
+    """A parent whose live endpoint is provable, for credential-resolution assertions."""
+    parent = MagicMock()
+    parent.base_url = base_url
+    parent.api_key = api_key
+    parent.request_overrides = None
+    parent._client_kwargs = {"base_url": base_url, "api_key": api_key}
+    parent.client = None
+    return parent
+
+
+def test_review_api_key_env_resolves_through_delegation_credentials(monkeypatch):
+    """The surviving alias must reach the same pointer reader the delegation surface uses."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"review": {
+            "provider": "cliproxy",
+            "model": "gemini-4-argon-high",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key_env": "FAKE_REVIEW_API_KEY",
+        }}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.get_env_value_prefer_dotenv",
+        lambda key: "sk-test-fake-review-key" if key == "FAKE_REVIEW_API_KEY" else "",
+    )
+    from tools.delegate_tool import _resolve_delegation_credentials
+
+    cfg = re_mod._load_review_credentials_cfg()
+    creds = _resolve_delegation_credentials(cfg, _credential_parent())
+    assert creds["api_key"] == "sk-test-fake-review-key"
+
+
+def test_review_inline_api_key_beats_api_key_env_pointer(monkeypatch):
+    """Inline ``api_key`` outranks every pointer — the passthrough layer adds no reordering."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"review": {
+            "provider": "cliproxy",
+            "model": "gemini-4-argon-high",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "sk-test-fake-inline-key",
+            "api_key_env": "FAKE_REVIEW_API_KEY",
+        }}},
+    )
+
+    def _boom(key):
+        raise AssertionError("env pointer must not be consulted when api_key is set")
+
+    monkeypatch.setattr("hermes_cli.config.get_env_value_prefer_dotenv", _boom)
+    from tools.delegate_tool import _resolve_delegation_credentials
+
+    cfg = re_mod._load_review_credentials_cfg()
+    creds = _resolve_delegation_credentials(cfg, _credential_parent())
+    assert creds["api_key"] == "sk-test-fake-inline-key"
 
 def test_load_review_credentials_cfg_auto_means_inherit(monkeypatch):
     monkeypatch.setattr(
