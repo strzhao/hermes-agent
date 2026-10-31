@@ -4762,6 +4762,16 @@ Write only the summary body. Do not include any preamble or prefix."""
             return None
 
         for msg in reversed(messages[last_user_idx + 1:]):
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "user"
+                and not cls._is_actionable_user_turn(msg)
+            ):
+                # Operational traffic (internal notifications, hidden
+                # scaffolding; a /steer row stays actionable): not a human
+                # turn, so it neither ends the task nor hides an already
+                # delivered final answer behind it (#147339).
+                continue
             if not isinstance(msg, dict) or msg.get("role") != "assistant":
                 # Trailing tool result (or anything else): still mid-task.
                 break
