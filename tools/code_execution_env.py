@@ -136,9 +136,17 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     child_env["PYTHONUTF8"] = "1"
     # Only TZ reaches the child; HERMES_TIMEZONE is an internal setting (and under the multiplexed
     # gateway holds only the default profile's value — hermes_time resolves the routed profile's).
-    from hermes_time import get_timezone_name
+    from hermes_time import get_timezone, get_timezone_name
 
-    _tz_name = get_timezone_name()
+    # A ZoneInfo means the Hermes config chain resolved a VALID timezone and stays
+    # authoritative; anything else (unset, or an invalid configured value, which hermes_time
+    # caches with a null ZoneInfo) means no Hermes timezone opinion,
+    # so inherit the parent's TZ like PATH/HOME/LANG — it describes the deployment
+    # locale, and a container launched the conventional way (TZ=Area/City, no Hermes
+    # timezone config) must not run its sandbox children in the image's UTC (#138741).
+    _tz_name = get_timezone_name() if get_timezone() is not None else ""
+    if not _tz_name:
+        _tz_name = os.environ.get("TZ", "")
     # Windows CPython does not support IANA names in TZ.  Leaving TZ unset
     # preserves the OS-configured local timezone for the child process.
     if _tz_name and not _IS_WINDOWS:
