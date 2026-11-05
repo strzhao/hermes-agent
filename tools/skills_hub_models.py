@@ -285,7 +285,11 @@ def _referenced_support_paths(skill_md: str) -> Optional[set[str]]:
         return None
     paths: set[str] = set()
     for match in _LOCAL_LINK_RE.finditer(normalized):
-        candidate = match.group(1).rstrip(".,;:")
+        # A trailing ``:LINE`` / ``:LINE:COL`` is a file:line citation, not a bundle path:
+        # ``see scripts/eval.ts:8`` in prose otherwise poisons the whole bundle (#149748) the
+        # same way out-of-skill links did before #115171. #L8-style fragments are already
+        # split off by urlsplit; only the un-split colon suffix reaches here.
+        candidate = re.sub(r"(:\d+)+$", "", match.group(1).rstrip(".,;:"))
         parsed = urlsplit(candidate)
         raw = unquote(parsed.path)
         if (candidate.endswith("?") or any(char in raw for char in "*?[]")
